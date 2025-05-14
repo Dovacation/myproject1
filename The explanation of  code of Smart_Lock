@@ -1,1 +1,175 @@
+#include <Arduino.h>       // Arduino核心库
+#include <WiFi.h>          // ESP32 WiFi功能库
+#include <HTTPClient.h>    // HTTP客户端库
+#include <PubSubClient.h>  // MQTT客户端库
+#include <ArduinoJson.h>  // JSON处理库
+作用：引入实现功能所需的库文件，为WiFi连接、HTTP请求、MQTT通信和JSON解析提供支持。
 
+#define LED 2             // 板载LED引脚
+const int AIN1 = 5;       // 电机驱动A输入1
+const int AIN2 = 4;       // 电机驱动A输入2
+const int PWMA = 15;      // 电机A PWM控制引脚
+作用：定义硬件连接的GPIO引脚，用于控制LED和电机驱动模块。
+
+const char* id = "24371068";          // PEAP认证ID
+const char* password = "sfz060330";   // PEAP认证密码
+const char* ssid = "BUAA-Mobile";     // 校园WiFi名称
+说明：配置WPA2-Enterprise校园网认证信息，用于连接需要PEAP认证的WiFi网络。
+
+#define PRODUCT_KEY "a1C6qtpIPNw"          // 阿里云产品Key
+#define DEVICE_NAME "esp32lock"            // 设备名称
+#define DEVICE_SECRET "545b0a262040c08b..."// 设备密钥
+#define REGION_ID "cn-shanghai"            // 地域ID
+
+// MQTT连接参数
+#define MQTT_SERVER PRODUCT_KEY ".iot-as-mqtt." REGION_ID ".aliyuncs.com" // 组合生成MQTT服务器地址
+#define MQTT_PORT 1883                    // 非加密端口
+#define MQTT_USRNAME DEVICE_NAME "&" PRODUCT_KEY // 用户名格式
+#define CLIENT_ID "..."                   // 客户端ID（包含安全参数）
+#define MQTT_PASSWD "..."                 // HMAC-SHA256加密密码
+作用：配置阿里云物联网平台的设备认证信息，构建符合阿里云规范的MQTT连接参数。
+
+const char* api_url = "https://api.newayz.com/..."; // 定位API地址
+String post_id = "1675840238995-****";              // 请求ID
+String asset_id = "8bedcf60-...";                   // 资产ID
+String manufacturer = "esp32-s2";                   // 设备厂商信息
+作用：配置室内定位平台API的参数，用于上报WiFi扫描数据获取位置信息。
+
+WiFiClient espClient;           // WiFi客户端实例
+PubSubClient client(espClient); // MQTT客户端实例
+DynamicJsonDocument wifi_doc(4096); // 存储WiFi扫描数据的JSON文档
+bool getLocation = false;       // 定位触发标志
+bool locationObtained = false;  // 定位成功状态标志
+作用：声明全局对象，包括网络客户端实例和状态管理变量。
+
+void wifiInit() {
+    WiFi.mode(WIFI_STA);                   // 设置WiFi为Station模式
+    WiFi.begin(ssid, WPA2_AUTH_PEAP, "", id, password); // PEAP认证连接
+    while (WiFi.status() != WL_CONNECTED) { // 等待连接
+        delay(1000);
+        Serial.println("WiFi not Connect");
+    }
+    Serial.println("WiFi Connected");
+}
+流程：
+设置WiFi工作模式
+使用WPA2-Enterprise认证连接校园网
+阻塞等待直到连接成功
+
+void wifi_scan() {
+  int n = WiFi.scanNetworks(); // 执行WiFi扫描
+  wifi_doc.clear(); // 清空JSON文档
+  
+  // 构建基础JSON结构
+  wifi_doc["id"] = post_id;
+  wifi_doc["asset"]["id"] = asset_id;
+  wifi_doc["asset"]["manufacturer"] = manufacturer;
+  
+  // 创建location对象
+  JsonObject location = wifi_doc.createNestedObject("location");
+  location["timestamp"] = millis();
+  
+  // 添加扫描到的AP信息
+  JsonArray wifis = location.createNestedArray("wifis");
+  for (int i=0; i<n; i++) {
+    JsonObject wifi = wifis.createNestedObject();
+    wifi["macAddress"] = WiFi.BSSIDstr(i);    // AP的MAC地址
+    wifi["signalStrength"] = WiFi.RSSI(i);    // 信号强度
+  }
+}
+功能：扫描周围WiFi热点，将结果按指定JSON格式组织，用于后续定位请求
+
+void get_location() {
+  HTTPClient http;
+  http.begin(api_url); // 初始化HTTP连接
+  http.addHeader("Content-Type", "application/json"); // 设置JSON头
+  
+  String payload;
+  serializeJson(wifi_doc, payload); // 序列化JSON为字符串
+  
+  int httpCode = http.POST(payload); // 发送POST请求
+  if (httpCode == HTTP_CODE_OK) {
+    // 解析响应中的定位信息
+    DynamicJsonDocument res(1024);
+    deserializeJson(res, http.getString());
+    if (res.containsKey("location")) {
+      String address = res["location"]["address"]["name"];
+      locationObtained = true; // 标记定位成功
+    }
+  }
+  http.end(); // 释放资源
+}
+流程：
+初始化HTTP客户端
+发送包含WiFi数据的POST请求
+解析响应并提取定位地址
+更新定位状态标志
+
+void mqttCheckConnect() {
+    if (!client.connected()) {
+        // 尝试连接（使用阿里云三元组认证）
+        if (client.connect(CLIENT_ID, MQTT_USRNAME, MQTT_PASSWD)) {
+            client.subscribe(ALINK_TOPIC_PROP_SET); // 订阅属性设置主题
+        }
+    }
+}
+功能：维护MQTT连接，断线自动重连，并订阅云端指令下发的主题。
+
+//MQTT消息回调
+void callback(char* topic, byte* payload, unsigned int length) {
+    // 解析收到的JSON指令
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, String((char*)payload));
+    
+    // 处理不同控制指令
+    if (doc["params"].containsKey("deng")) { // LED控制
+        digitalWrite(LED, doc["params"]["deng"]); 
+    }
+    if (doc["params"].containsKey("nav")) { // 定位控制
+        getLocation = (doc["params"]["nav"] == 1);
+    }
+    if (doc["params"].containsKey("suo")) { // 电机控制
+        // 驱动电机执行开锁动作
+        digitalWrite(AIN1, HIGH);
+        digitalWrite(AIN2, LOW);
+        analogWrite(PWMA, 255); // 全速转动
+        delay(2225);           // 保持2.225秒
+        // 停止电机
+        digitalWrite(AIN1, LOW);
+        digitalWrite(AIN2, LOW);
+    }
+}
+指令处理逻辑：
+deng：控制板载LED开关
+nav：触发/停止定位流程
+suo：驱动电机执行开锁动作（通过H桥电路控制电机正反转）
+
+void setup() {
+    // 初始化硬件引脚
+    pinMode(LED, OUTPUT);
+    pinMode(AIN1, OUTPUT);
+    pinMode(AIN2, OUTPUT);
+    pinMode(PWMA, OUTPUT);
+    
+    // 初始化串口
+    Serial.begin(115200);
+    
+    // 连接WiFi和MQTT
+    wifiInit();
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+    client.setCallback(callback);
+}
+
+void loop() {
+    mqttCheckConnect();    // 维护MQTT连接
+    client.loop();         // 处理MQTT消息
+    
+    // 定位任务处理
+    if (getLocation && !locationObtained) {
+        wifi_scan();        // 执行WiFi扫描
+        get_location();     // 请求定位
+        delay(5000);        // 5秒间隔
+    } else {
+        delay(2000);        // 常规等待
+    }
+}
